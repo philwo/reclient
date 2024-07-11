@@ -29,19 +29,7 @@ import (
 	"github.com/bazelbuild/reclient/internal/pkg/event"
 	"github.com/bazelbuild/reclient/internal/pkg/features"
 	iproc "github.com/bazelbuild/reclient/internal/pkg/inputprocessor"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/archive"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/clangcl"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/clanglink"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/clanglint"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/cppcompile"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/d8"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/headerabi"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/javac"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/metalava"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/nacl"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/r8"
 	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/tool"
-	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/action/typescript"
 	"github.com/bazelbuild/reclient/internal/pkg/inputprocessor/depscache"
 	"github.com/bazelbuild/reclient/internal/pkg/labels"
 	"github.com/bazelbuild/reclient/internal/pkg/localresources"
@@ -92,7 +80,6 @@ type Executor interface {
 
 // InputProcessor retrieves the input spec for commands.
 type InputProcessor struct {
-	cppDepScanner   cppcompile.CPPDependencyScanner
 	cppLinkDeepScan bool
 	depScanTimeout  time.Duration
 	executor        Executor
@@ -143,7 +130,7 @@ func NewInputProcessor(ctx context.Context, executor Executor, resMgr *localreso
 	if err != nil {
 		return nil, func() {}, err
 	}
-	ip := newInputProcessor(depScanner, opt.IPTimeout, opt.CppLinkDeepScan, executor, resMgr, fmc, l)
+	ip := newInputProcessor(executor, resMgr, fmc, l)
 	cleanup := func() {}
 	if useDepsCache && (!depScanner.Capabilities().GetCaching() || features.GetConfig().ExperimentalGomaDepsCache) {
 		ip.depsCache, cleanup = newDepsCache(opt.CacheDir, l)
@@ -156,20 +143,17 @@ func NewInputProcessor(ctx context.Context, executor Executor, resMgr *localreso
 
 // NewInputProcessorWithStubDependencyScanner creates a new input processor with given parallelism
 // and a stub CPP dependency scanner. It is meant to be only used for testing.
-func NewInputProcessorWithStubDependencyScanner(ds cppcompile.CPPDependencyScanner, cppLinkDeepScan bool, executor Executor, resMgr *localresources.Manager) *InputProcessor {
-	return newInputProcessor(ds, 0, cppLinkDeepScan, executor, resMgr, nil, nil)
+func NewInputProcessorWithStubDependencyScanner(executor Executor, resMgr *localresources.Manager) *InputProcessor {
+	return newInputProcessor(executor, resMgr, nil, nil)
 }
 
-func newInputProcessor(ds cppcompile.CPPDependencyScanner, depScanTimeout time.Duration, cppLinkDeepScan bool, executor Executor, resMgr *localresources.Manager, fmc filemetadata.Cache, l *logger.Logger) *InputProcessor {
+func newInputProcessor(executor Executor, resMgr *localresources.Manager, fmc filemetadata.Cache, l *logger.Logger) *InputProcessor {
 	return &InputProcessor{
-		cppDepScanner:   ds,
-		cppLinkDeepScan: cppLinkDeepScan,
-		depScanTimeout:  depScanTimeout,
-		executor:        executor,
-		resMgr:          resMgr,
-		fmc:             fmc,
-		slots:           semaphore.NewWeighted(int64(runtime.NumCPU())),
-		logger:          l,
+		executor: executor,
+		resMgr:   resMgr,
+		fmc:      fmc,
+		slots:    semaphore.NewWeighted(int64(runtime.NumCPU())),
+		logger:   l,
 	}
 }
 
@@ -265,111 +249,39 @@ func (p *InputProcessor) ProcessInputs(ctx context.Context, opts *ProcessInputsO
 		NormalizedFileCache: &p.nfc,
 		FileStatCache:       &p.fsc,
 	}
-	cp := &cppcompile.Preprocessor{
+	pp = &tool.Preprocessor{
 		BasePreprocessor: bp,
-		CPPDepScanner:    p.cppDepScanner,
-		Rec:              rec,
-		DepsCache:        p.depsCache,
-		CmdEnvironment:   opts.CmdEnvironment,
-		DepScanTimeout:   p.depScanTimeout,
-		Slots:            p.slots,
 	}
-	switch lbls {
-	case labels.ToolLabels():
-		pp = &tool.Preprocessor{
-			BasePreprocessor: bp,
+	ch := make(chan bool)
+	var res *iproc.ActionSpec
+	var err error
+	go func() {
+		res, err = iproc.Compute(pp, options)
+		// in a general sense ErrIPTimeout represents an error caused by IP execution
+		// exceeding IPTimeout value (set by ip_timeout) flag; however,
+		// at the moment IPTimeout is used only by cpp dependency scanner.
+		// If, in the future, it will be used more widely, more error types might need to be
+		// translated to ErrIPTimeout
+		if errors.Is(err, cppdependencyscanner.ErrDepsScanTimeout) {
+			err = fmt.Errorf("%w: %v", ErrIPTimeout, err)
 		}
-	// SignAPKLabels is equivalent to ToolLabels, but
-	// is kept for historical reasons and for distinction.
-	case labels.SignAPKLabels():
-		pp = &tool.Preprocessor{
-			BasePreprocessor: bp,
+		close(ch)
+	}()
+	select {
+	case <-ch:
+		if err != nil {
+			return nil, err
 		}
-	case labels.D8Labels():
-		pp = &d8.Preprocessor{
-			BasePreprocessor: bp,
-		}
-	case labels.R8Labels():
-		pp = &r8.Preprocessor{
-			BasePreprocessor: bp,
-		}
-	case labels.MetalavaLabels():
-		pp = &metalava.Preprocessor{
-			BasePreprocessor: bp,
-		}
-	case labels.ClangCppLabels():
-		pp = cp
-	case labels.ClangLintLabels():
-		pp = &clanglint.Preprocessor{
-			Preprocessor: cp,
-		}
-	case labels.HeaderAbiDumpLabels():
-		pp = &headerabi.Preprocessor{
-			Preprocessor: cp,
-		}
-	case labels.ClangCLCppLabels():
-		pp = &clangcl.Preprocessor{
-			Preprocessor: cp,
-		}
-	case labels.NaClLabels():
-		pp = &nacl.Preprocessor{
-			Preprocessor: cp,
-		}
-	case labels.ClangLinkLabels():
-		pp = &clanglink.Preprocessor{
-			BasePreprocessor: bp,
-			ARDeepScan:       p.cppLinkDeepScan,
-		}
-	case labels.NaClLinkLabels():
-		pp = &clanglink.Preprocessor{
-			BasePreprocessor: bp,
-			ARDeepScan:       p.cppLinkDeepScan,
-		}
-	case labels.JavacLabels():
-		pp = &javac.Preprocessor{
-			BasePreprocessor: bp,
-		}
-	case labels.LLVMArLabels():
-		pp = &archive.Preprocessor{
-			BasePreprocessor: bp,
-		}
-	case labels.TscLabels():
-		pp = &typescript.Preprocessor{
-			BasePreprocessor: bp,
-		}
+		return &CommandIO{
+			InputSpec:             res.InputSpec,
+			OutputFiles:           res.OutputFiles,
+			OutputDirectories:     res.OutputDirectories,
+			EmittedDependencyFile: res.EmittedDependencyFile,
+			UsedShallowMode:       res.UsedShallowMode,
+		}, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("context was cancelled before completing input processing")
 	}
-	if pp != nil {
-		ch := make(chan bool)
-		var res *iproc.ActionSpec
-		var err error
-		go func() {
-			res, err = iproc.Compute(pp, options)
-			// in a general sense ErrIPTimeout represents an error caused by IP execution
-			// exceeding IPTimeout value (set by ip_timeout) flag; however,
-			// at the moment IPTimeout is used only by cpp dependency scanner.
-			// If, in the future, it will be used more widely, more error types might need to be
-			// translated to ErrIPTimeout
-			if errors.Is(err, cppdependencyscanner.ErrDepsScanTimeout) {
-				err = fmt.Errorf("%w: %v", ErrIPTimeout, err)
-			}
-			close(ch)
-		}()
-		select {
-		case <-ch:
-			if err != nil {
-				return nil, err
-			}
-			return &CommandIO{
-				InputSpec:             res.InputSpec,
-				OutputFiles:           res.OutputFiles,
-				OutputDirectories:     res.OutputDirectories,
-				EmittedDependencyFile: res.EmittedDependencyFile,
-				UsedShallowMode:       res.UsedShallowMode,
-			}, nil
-		case <-ctx.Done():
-			return nil, fmt.Errorf("context was cancelled before completing input processing")
-		}
 
-	}
 	return nil, status.Errorf(codes.Unimplemented, "unsupported labels: %v", opts.Labels)
 }
