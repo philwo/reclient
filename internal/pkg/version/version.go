@@ -26,7 +26,6 @@ import (
 	"github.com/bazelbuild/reclient/internal/pkg/rbeflag"
 
 	log "github.com/golang/glog"
-	"golang.org/x/mod/modfile"
 )
 
 const undef = "undefined"
@@ -35,8 +34,6 @@ const undef = "undefined"
 // version number. Refer to README.md for guidelines on when / how to update
 // version numbers.
 var (
-	sdkVersionSHA = undef
-
 	// versionFlag is a boolean flag to determine whether to print version number or not.
 	versionFlag = flag.Bool("version", false, "If provided, print the current binary version and exit. If version_sdk is also provided, it takes precedence.")
 
@@ -63,26 +60,11 @@ func PrintAndExitOnVersionFlag(info bool) {
 	}
 }
 
-//go:embed version.txt
-var version string
-
 // CurrentVersion returns the current version number in semver format.
 func CurrentVersion() string {
-	return version
+	return undef
 }
 
-//go:embed go.mod.txt
-var gomod []byte
-
 func SdkVersion() string {
-	f, err := modfile.ParseLax("go.mod", gomod, nil)
-	if err != nil {
-		return undef
-	}
-	for _, r := range f.Require {
-		if r.Mod.Path == "github.com/bazelbuild/remote-apis-sdks" {
-			return r.Mod.Version
-		}
-	}
 	return undef
 }
